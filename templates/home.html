@@ -1,0 +1,10 @@
+{% extends "base.html" %}
+
+{% block content %}
+<a href="newpost">Write a new post</a>
+<a href="logout">Logout</a>
+  {% for p in posts %}
+    {{ p.render() | safe }}<!--using the safe so that user's blog doesn't appear as html code -->
+  {% endfor %}
+<div>Queried {{lasttime}} seconds ago</div>
+{% endblock %}

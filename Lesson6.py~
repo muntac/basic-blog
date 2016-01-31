@@ -1,0 +1,300 @@
+import os
+import re
+import cgi
+import hmac
+import json
+import time
+import random
+import hashlib
+import pickle
+from string import letters
+
+import jinja2
+import webapp2
+
+from google.appengine.api import memcache
+from google.appengine.ext import db
+
+current_dir = os.path.join(os.path.dirname(__file__), 'templates')
+#Set up jinja environment
+jinja_env = jinja2.Environment(loader = jinja2.FileSystemLoader(current_dir), autoescape = True)
+
+def render_str(template, **params):
+    t = jinja_env.get_template(template)
+    return t.render(params)
+
+#Base-Handler Class
+class Handler(webapp2.RequestHandler):
+    def write(self, *a, **kw):#shortcut for self.response.write
+        self.response.write(*a, **kw)
+
+    def render_str(self, template, **kw):#Uses Jinja render() to render template and return it as a unicode string
+        jinja_tempobj = jinja_env.get_template(template) #loads template from the environment
+        return jinja_tempobj.render(kw)
+
+    def render(self, template, **kw):#Simply calls write on the Jinja template string
+        self.write(self.render_str(template, **kw))
+
+    def set_secure_cookie(self, name, val):
+        cookie_val = validation.make_secure_val(val)
+        self.response.headers.add_header('Set-Cookie', '%s=%s; Path=/' % (name, cookie_val))
+
+    def read_secure_cookie(self, name):
+        cookie_val = self.request.cookies.get(name)
+        if cookie_val:
+            return validation.check_secure_val(cookie_val)
+
+    def login(self, userobj):
+        self.set_secure_cookie('user_id', str(userobj.key().id()))
+
+    def logout(self):
+        self.response.headers.add_header('Set-Cookie', 'user_id=; Path=/')
+        #if there are other user related cookies those need to be deleted too
+    
+    def initialize(self, *a, **kw):
+        webapp2.RequestHandler.initialize(self, *a, **kw)
+        uid = self.read_secure_cookie('user_id')
+        if uid:
+            self.user = User.get_by_id(int(uid))
+        else:
+            self.user = None
+
+#DataStore Entity: User
+class User(db.Model):
+    username = db.StringProperty(required = True)
+    password = db.StringProperty(required = True)
+    email = db.StringProperty()
+
+    @classmethod
+    def by_name(cls, uname):
+        usr = cls.all().filter('name =', uname).get()
+        return usr
+
+    @classmethod
+    def register(cls, reg_username, reg_password, reg_email):
+        hashed_pwd = validation.hash_password(reg_username, reg_password)
+        usr = User(username = reg_username, password = hashed_pwd, email = reg_email)
+        usr.put()
+        return usr
+
+#DataStore Entity: BlogPost
+class BlogPost(db.Model):
+    subject = db.StringProperty(required = True)
+    content = db.TextProperty(required = True)
+    creationtime = db.DateTimeProperty(auto_now_add = True)
+
+    def render(self):#Formatting the user's input
+        self._render_text = self.content.replace('\n', '<br>')
+        return render_str("post.html", p = self)
+
+#Validation Class
+class validation:
+    USER_RE = re.compile(r'^[a-zA-Z0-9_-]{3,20}$')
+    PASS_RE = re.compile(r'^.{3,20}$')
+    EMAIL_RE  = re.compile(r'^[\S]+@[\S]+\.[\S]+$')    
+    secret = 'peskapolowitz'
+
+    @classmethod
+    def valid_username(cls, username):
+        if username and cls.USER_RE.match(username):
+            if User.by_name(username) is None:
+                return username
+
+    @classmethod
+    def valid_password(cls, password):
+        return password and cls.PASS_RE.match(password)
+
+    @classmethod
+    def valid_email(cls, email):
+        return not email or cls.EMAIL_RE.match(email)
+
+    @classmethod
+    def get_salt(cls, length = 5):
+        return ''.join(random.choice(letters) for x in xrange(length))
+
+    @classmethod
+    def hash_password(cls, username, password, salt=None):
+        if salt is None:
+            salt = cls.get_salt()
+        hashed_pwd = hashlib.sha256(username + password + salt).hexdigest()
+        return '%s,%s' % (salt, hashed_pwd)
+
+    @classmethod
+    def make_secure_val(cls, val):
+        secure_val = hmac.new(cls.secret, val).hexdigest()
+        return '%s|%s' % (val, secure_val)
+
+    @classmethod
+    def check_secure_val(cls, read_val):
+        read_val_front = read_val.split('|')[0]
+        new_val = cls.make_secure_val(read_val_front)
+        if new_val == read_val:
+            return read_val_front
+
+#Handler Class: New post
+class NewPost(Handler):
+    def get(self):
+        self.render("newpost.html")
+
+    def post(self):
+        #Enter blog post in database
+        subject = self.request.get("subject")
+        content = self.request.get("content")
+        if subject and content:
+            a = BlogPost(subject = subject, content = content)
+            keyblog = a.put()
+            memcache.set("home",None)
+            self.redirect("/blog/" + str(keyblog.id()) )
+        else:
+            error = "Post must have BOTH a subject and a content"
+            self.render(subject = subject, content = content, error = error)
+
+#Handler Class: Post Page
+class PostPage(Handler):
+    def get(self, post_id):
+        mempost = memcache.get(post_id)
+        last_queried = 0
+        if mempost is None:
+            post = BlogPost.get_by_id(int(post_id))
+            if not post:
+                self.error(404)
+                return
+            memcache.set(post_id,( (post.subject,post.content,post.creationtime), time.time() ) )
+        else:
+            last_queried = time.time() - mempost[1]
+            post = BlogPost(subject = mempost[0][0], content = mempost[0][1], creationtime = mempost[0][2])
+        self.render("permalink.html", post = post, lasttime = last_queried)
+
+#Handler Class: Home page
+class HomePage(Handler):
+    def get(self):
+        if self.user:
+            self.write("Welcome, " + self.user.username + "!")
+        else:
+            self.redirect('login')
+        #res = db.GqlQuery("select * from BlogPost order by creationtime desc limit 10")
+        #self.render("home.html", posts = res)
+
+#Handler Class: SignUp
+class SignUp(Handler):
+    def get(self):
+        self.render("signup.html")
+
+    def post(self):
+        username = self.request.get("username")
+        password = self.request.get("password")
+        verify = self.request.get("verify")
+        email = self.request.get("email")
+        
+        params = dict(username = username, email = email)
+        error_flag = False
+
+        if validation.valid_username(username) is None:
+            params['error_username'] = "Invalid username"
+            error_flag = True
+        if validation.valid_password(password) is None:
+            params['error_password'] = "Invalid password"
+            error_flag = True
+        elif password != verify:
+            params['error_verify'] = "Passwords don't match"
+            error_flag = True
+        if validation.valid_email(email) is None:
+            params['error_email'] = "Email is invalid"
+            error_flag = True
+        if error_flag:
+            self.render("signup.html", **params)
+        else:
+            usrobj = User.register(username, password, email)
+            self.login(usrobj)
+            self.redirect('welcome')
+
+#Handler Class: LogIn
+class LogIn(Handler):
+    def get(self):
+        if not self.user:
+            self.render("login.html")
+        else:
+            self.redirect('welcome')
+    def post(self):
+        username = self.request.get("username")
+        password = self.request.get("password")
+        params = dict(username=username)
+        error_flag = False
+
+        if username == "":
+            params['error_username'] = "Username cannot be empty"
+            error_flag = True
+        if password == "":
+            params['error_password'] = "Password cannot be empty"
+            error_flag = True
+
+        if error_flag:
+            self.render("login.html", **params)
+        else:
+            usr_details = User.all().filter('username =', username).get()
+            if (usr_details is not None) and (validation.hash_password(username, password, usr_details.password.split(",")[0]) == usr_details.password):
+                self.login(usr_details)
+                self.redirect('/')
+            else:
+                self.render("login.html", username=username, error_validation="Invalid login details")
+                
+class LogOut(Handler):
+    def get(self):
+        self.logout()
+        self.redirect('signup')
+
+class BlogPage(Handler):
+    def get(self):
+        ls = []
+        timelast = 0
+        #memcache.flush_all()
+        if memcache.get("home") is None:
+            res = db.GqlQuery("select * from BlogPost order by creationtime desc limit 10")
+            for post in res:
+                ls.append( (post.subject, post.content, post.creationtime) )
+            memcache.set("home", (ls,time.time()))
+        else:
+            cacheval = memcache.get("home")
+            ls = cacheval[0]
+            timelast = time.time() - cacheval[1]
+        lspost = []
+        for x in ls:
+            lspost.append(BlogPost(subject = x[0], content = x[1], creationtime = x[2]))
+        self.render("home.html", posts = lspost, lasttime = timelast)
+
+class JsonBlogPage(Handler):
+    def get(self):
+        res = db.GqlQuery("select * from BlogPost order by creationtime desc limit 10")
+        ls = []
+        for post in res:
+            ls.append({"content": post.content, "created": post.creationtime.strftime("%b %d %Y"), "last_modified": post.creationtime.strftime("%b %d %Y"), "subject": post.subject})
+        self.response.headers['Content-Type'] = 'application/json; charset=UTF-8'
+        self.write(json.dumps(ls))
+            
+class JsonPostPage(Handler):
+    def get(self, post_id):
+        post = BlogPost.get_by_id(int(post_id))
+        if not post:
+            self.error(404)
+            return
+        jsdict = {"content": post.content, "created": post.creationtime.strftime("%b %d %Y"), "last_modified": post.creationtime.strftime("%b %d %Y"), "subject": post.subject}
+        self.response.headers['Content-Type'] = 'application/json; charset=UTF-8'
+        self.write(json.dumps(jsdict))
+
+class Flush(Handler):
+    def get(self):
+        memcache.flush_all()
+
+app = webapp2.WSGIApplication([(r'/blog/welcome', HomePage),
+                               (r'/', HomePage),
+                               (r'/blog/signup', SignUp),
+                               (r'/blog/login', LogIn),
+                               (r'/blog/logout', LogOut),
+                               (r'/blog', BlogPage),
+                               (r'/blog/newpost', NewPost),
+                               (r'/blog/([0-9]+)', PostPage),
+                               (r'/blog/.json', JsonBlogPage),
+                               (r'/blog/([0-9]+).json', JsonPostPage),
+                               (r'/blog/flush', Flush),
+                               ],
+                              debug = True)
